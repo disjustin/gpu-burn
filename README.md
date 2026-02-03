@@ -69,6 +69,15 @@ can be set to change the resulting image tag:
 
 `make IMAGE_NAME=myregistry.private.com/gpu-burn CUDA_VERSION=12.0.1 IMAGE_DISTRO=ubuntu22.04 image`
 
+To build with external PTX file:
+
+1. Remove the -DEMBED_PTX flag from Makefile line 17, then:
+
+- `make clean`
+- `make`
+
+Now gpu_burn will require compare.ptx in the working directory (old behavior)
+
 ## Usage
 
 ```plain

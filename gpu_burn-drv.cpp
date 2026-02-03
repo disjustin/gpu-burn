@@ -64,6 +64,10 @@
 #define CUDA_ENABLE_DEPRECATED
 #include <cuda.h>
 
+#ifdef EMBED_PTX
+#include "compare_ptx.h"
+#endif
+
 void _checkError(int rCode, std::string file, int line, std::string desc = "") {
     if (rCode != CUDA_SUCCESS) {
         const char *err;
@@ -235,12 +239,18 @@ template <class T> class GPU_Test {
     }
 
     void initCompareKernel() {
+#ifdef EMBED_PTX
+        // Load embedded PTX from memory
+        checkError(cuModuleLoadData(&d_module, embedded_compare_ptx), "load embedded module");
+#else
+        // Load PTX from file (original behavior)
         {
             std::ifstream f(d_kernelFile);
             checkError(f.good() ? CUDA_SUCCESS : CUDA_ERROR_NOT_FOUND,
                        std::string("couldn't find compare kernel: ") + d_kernelFile);
         }
         checkError(cuModuleLoad(&d_module, d_kernelFile), "load module");
+#endif
         checkError(cuModuleGetFunction(&d_function, d_module,
                                        d_doubles ? "compareD" : "compare"),
                    "get func");

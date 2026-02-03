@@ -14,6 +14,7 @@ override CFLAGS   += -Wno-unused-result
 override CFLAGS   += -I${CUDAPATH}/include
 override CFLAGS   += -std=c++11
 override CFLAGS   += -DIS_JETSON=${IS_JETSON}
+override CFLAGS   += -DEMBED_PTX
 
 override LDFLAGS  ?=
 override LDFLAGS  += -lcuda
@@ -38,17 +39,25 @@ IMAGE_NAME ?= gpu-burn
 
 .PHONY: clean
 
-gpu_burn: gpu_burn-drv.o compare.ptx
-	g++ -o $@ $< -O3 ${LDFLAGS}
+# Generate embedded PTX header from PTX file
+compare_ptx.h: compare.ptx
+	@echo "Generating embedded PTX header..."
+	@echo "// Auto-generated from compare.ptx - Do not edit manually" > $@
+	@echo "const char embedded_compare_ptx[] = R\"PTX(" >> $@
+	@cat compare.ptx >> $@
+	@echo ")PTX\";" >> $@
 
-%.o: %.cpp
+gpu_burn: gpu_burn-drv.o compare_ptx.h
+	g++ -o $@ gpu_burn-drv.o -O3 ${LDFLAGS}
+
+%.o: %.cpp compare_ptx.h
 	g++ ${CFLAGS} -c $<
 
 %.ptx: %.cu
 	PATH="${PATH}:${CCPATH}:." ${NVCC} ${NVCCFLAGS} -ptx $< -o $@
 
 clean:
-	$(RM) *.ptx *.o gpu_burn
+	$(RM) *.ptx *.o gpu_burn compare_ptx.h
 
 image:
 	docker build --build-arg CUDA_VERSION=${CUDA_VERSION} --build-arg IMAGE_DISTRO=${IMAGE_DISTRO} -t ${IMAGE_NAME} .

@@ -68,6 +68,12 @@
 #include "compare_ptx.h"
 #endif
 
+#include "structured_output.h"
+#include "config_parser.h"
+
+// Global structured logger
+StructuredLogger g_logger;
+
 void _checkError(int rCode, std::string file, int line, std::string desc = "") {
     if (rCode != CUDA_SUCCESS) {
         const char *err;
@@ -462,7 +468,7 @@ void updateTemps(int handle, std::vector<int> *temps) {
 #endif
 }
 
-void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
+std::map<int, bool> listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
                    int runTime, std::chrono::seconds sigterm_timeout_threshold_secs) {
     fd_set waitHandles;
 
@@ -611,7 +617,7 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
                 oneAlive = true;
         if (!oneAlive) {
             fprintf(stderr, "\n\nNo clients are alive!  Aborting\n");
-            exit(ENOMEDIUM);
+            exit(ExitCode::ERROR_ALL_CLIENTS_DEAD);
         }
 
         if (startTime + runTime < thisTime)
@@ -669,12 +675,17 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
     printf("done\n");
 
     printf("\nTested %d GPUs:\n", (int)clientPid.size());
-    for (size_t i = 0; i < clientPid.size(); ++i)
+    std::map<int, bool> faultMap;
+    for (size_t i = 0; i < clientPid.size(); ++i) {
         printf("\tGPU %d: %s\n", (int)i, clientFaulty.at(i) ? "FAULTY" : "OK");
+        faultMap[i] = clientFaulty.at(i);
+    }
+
+    return faultMap;
 }
 
 template <class T>
-void launch(int runLength, bool useDoubles, bool useTensorCores,
+int launch(int runLength, bool useDoubles, bool useTensorCores,
             ssize_t useBytes, int device_id, const char * kernelFile,
             std::chrono::seconds sigterm_timeout_threshold_secs) {
 #if IS_JETSON
@@ -685,6 +696,25 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
 #else
     system("nvidia-smi -L");
 #endif
+
+    // Collect GPU information for structured logging
+    int gpuCount = initCuda();
+    if (gpuCount == 0) {
+        fprintf(stderr, "No CUDA capable GPUs found.\n");
+        return ExitCode::ERROR_NO_GPUS;
+    }
+
+    if (g_logger.isEnabled()) {
+        for (int i = 0; i < gpuCount; i++) {
+            CUdevice device;
+            char deviceName[256];
+            size_t deviceMem;
+            checkError(cuDeviceGet(&device, i));
+            checkError(cuDeviceGetName(deviceName, 256, device));
+            checkError(cuDeviceTotalMem(&deviceMem, device));
+            g_logger.addGPU(i, deviceName, deviceMem / (1024 * 1024));
+        }
+    }
 
     // Initting A and B with random data
     T *A = (T *)malloc(sizeof(T) * SIZE * SIZE);
@@ -722,10 +752,28 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
             close(mainPipe[1]);
             int devCount;
             read(readMain, &devCount, sizeof(int));
-            listenClients(clientPipes, clientPids, runLength, sigterm_timeout_threshold_secs);
+            std::map<int, bool> faultMap = listenClients(clientPipes, clientPids, runLength, sigterm_timeout_threshold_secs);
+
+            // Write structured output if enabled
+            if (g_logger.isEnabled()) {
+                std::string precision = useDoubles ? "double" : "float";
+                g_logger.writeResults(faultMap, runLength, precision, useTensorCores);
+            }
+
+            // Determine exit code
+            bool anyFaulty = false;
+            for (const auto& kv : faultMap) {
+                if (kv.second) anyFaulty = true;
+            }
+
+            for (size_t i = 0; i < clientPipes.size(); ++i)
+                close(clientPipes.at(i));
+
+            free(A);
+            free(B);
+
+            return anyFaulty ? ExitCode::ERROR_GPU_FAULTY : ExitCode::SUCCESS;
         }
-        for (size_t i = 0; i < clientPipes.size(); ++i)
-            close(clientPipes.at(i));
     } else {
         pid_t myPid = fork();
         if (!myPid) {
@@ -749,7 +797,9 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
 
             if (!devCount) {
                 fprintf(stderr, "No CUDA devices\n");
-                exit(ENODEV);
+                free(A);
+                free(B);
+                return ExitCode::ERROR_NO_GPUS;
             } else {
                 for (int i = 1; i < devCount; ++i) {
                     int slavePipe[2];
@@ -766,45 +816,83 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
                                      useTensorCores, useBytes, kernelFile);
 
                         close(slavePipe[1]);
-                        return;
+                        return ExitCode::SUCCESS;
                     } else {
                         clientPids.push_back(slavePid);
                         close(slavePipe[1]);
                     }
                 }
 
-                listenClients(clientPipes, clientPids, runLength, sigterm_timeout_threshold_secs);
+                std::map<int, bool> faultMap = listenClients(clientPipes, clientPids, runLength, sigterm_timeout_threshold_secs);
+
+                // Write structured output if enabled
+                if (g_logger.isEnabled()) {
+                    std::string precision = useDoubles ? "double" : "float";
+                    g_logger.writeResults(faultMap, runLength, precision, useTensorCores);
+                }
+
+                // Determine exit code
+                bool anyFaulty = false;
+                for (const auto& kv : faultMap) {
+                    if (kv.second) anyFaulty = true;
+                }
+
+                for (size_t i = 0; i < clientPipes.size(); ++i)
+                    close(clientPipes.at(i));
+
+                free(A);
+                free(B);
+
+                return anyFaulty ? ExitCode::ERROR_GPU_FAULTY : ExitCode::SUCCESS;
             }
         }
-        for (size_t i = 0; i < clientPipes.size(); ++i)
-            close(clientPipes.at(i));
     }
 
+    // Should not reach here
     free(A);
     free(B);
+    return ExitCode::SUCCESS;
 }
 
 void showHelp() {
     printf("GPU Burn\n");
     printf("Usage: gpu-burn [OPTIONS] [TIME]\n\n");
-    printf("-m X\tUse X MB of memory.\n");
-    printf("-m N%%\tUse N%% of the available GPU memory.  Default is %d%%\n",
+    printf("OPTIONS:\n");
+    printf("-m X\t\tUse X MB of memory.\n");
+    printf("-m N%%\t\tUse N%% of the available GPU memory.  Default is %d%%\n",
            (int)(USEMEM * 100));
-    printf("-d\tUse doubles\n");
-    printf("-tc\tTry to use Tensor cores\n");
-    printf("-l\tLists all GPUs in the system\n");
-    printf("-i N\tExecute only on GPU N\n");
-    printf("-c FILE\tUse FILE as compare kernel.  Default is %s\n",
+    printf("-d\t\tUse doubles\n");
+    printf("-tc\t\tTry to use Tensor cores\n");
+    printf("-l\t\tLists all GPUs in the system\n");
+    printf("-i N\t\tExecute only on GPU N\n");
+    printf("-c FILE\t\tUse FILE as compare kernel.  Default is %s\n",
            COMPARE_KERNEL);
-    printf("-stts T\tSet timeout threshold to T seconds for using SIGTERM to abort child processes before using SIGKILL.  Default is %d\n",
+    printf("-o FILE\t\tWrite structured JSON results to FILE\n");
+    printf("-cfg FILE\tLoad configuration from JSON FILE\n");
+    printf("-stts T\t\tSet timeout threshold to T seconds for using SIGTERM\n");
+    printf("\t\tto abort child processes before using SIGKILL.  Default is %d\n",
            SIGTERM_TIMEOUT_THRESHOLD_SECS);
-    printf("-h\tShow this help message\n\n");
-    printf("Examples:\n");
-    printf("  gpu-burn -d 3600 # burns all GPUs with doubles for an hour\n");
-    printf(
-        "  gpu-burn -m 50%% # burns using 50%% of the available GPU memory\n");
-    printf("  gpu-burn -l # list GPUs\n");
-    printf("  gpu-burn -i 2 # burns only GPU of index 2\n");
+    printf("-h\t\tShow this help message\n\n");
+    printf("EXIT CODES:\n");
+    printf("  0 - Success (all GPUs passed)\n");
+    printf("  1 - No CUDA GPUs found\n");
+    printf("  2 - CUDA initialization failed\n");
+    printf("  3 - All client processes died\n");
+    printf("  4 - One or more GPUs are faulty\n");
+    printf("  5 - Invalid command-line arguments\n");
+    printf("  6 - Configuration file error\n");
+    printf("  7 - Kernel loading error\n\n");
+    printf("EXAMPLES:\n");
+    printf("  gpu-burn -d 3600\n");
+    printf("    Burn all GPUs with doubles for an hour\n\n");
+    printf("  gpu-burn -m 50%% -o results.json 600\n");
+    printf("    Burn using 50%% memory for 10 minutes, save results to JSON\n\n");
+    printf("  gpu-burn -cfg test_config.json\n");
+    printf("    Load all settings from configuration file\n\n");
+    printf("  gpu-burn -l\n");
+    printf("    List all GPUs\n\n");
+    printf("  gpu-burn -i 2 -tc 1800\n");
+    printf("    Burn only GPU 2 with Tensor cores for 30 minutes\n");
 }
 
 // NNN MB
@@ -829,6 +917,31 @@ int main(int argc, char **argv) {
     int device_id = -1;
     char *kernelFile = (char *)COMPARE_KERNEL;
     std::chrono::seconds sigterm_timeout_threshold_secs = std::chrono::seconds(SIGTERM_TIMEOUT_THRESHOLD_SECS);
+    std::string outputFile = "";
+    std::string configFile = "";
+
+    // Try to load config file first (if specified)
+    ConfigParser config;
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "-cfg", 4) == 0 && i + 1 < argc) {
+            configFile = argv[i + 1];
+            if (!config.loadFile(configFile)) {
+                fprintf(stderr, "Error: Could not load config file: %s\n", configFile.c_str());
+                return ExitCode::ERROR_CONFIG_FILE;
+            }
+            printf("Loaded configuration from: %s\n", configFile.c_str());
+            break;
+        }
+    }
+
+    // Apply config file defaults (command-line overrides these)
+    if (config.hasKey("duration")) runLength = config.getInt("duration", 10);
+    if (config.hasKey("use_doubles")) useDoubles = config.getBool("use_doubles", false);
+    if (config.hasKey("use_tensor_cores")) useTensorCores = config.getBool("use_tensor_cores", false);
+    if (config.hasKey("device_id")) device_id = config.getInt("device_id", -1);
+    if (config.hasKey("output_file")) outputFile = config.getString("output_file", "");
+    if (config.hasKey("memory_mb")) useBytes = (ssize_t)config.getInt("memory_mb", 0) * 1024 * 1024;
+    if (config.hasKey("memory_percent")) useBytes = -config.getInt("memory_percent", 0);
 
     std::vector<std::string> args(argv, argv + argc);
     for (size_t i = 1; i < args.size(); ++i) {
@@ -876,11 +989,11 @@ int main(int argc, char **argv) {
                 useBytes = decodeUSEMEM(argv[i]);
             } else {
                 fprintf(stderr, "Syntax error near -m\n");
-                exit(EINVAL);
+                return ExitCode::ERROR_INVALID_ARGS;
             }
             if (useBytes == 0) {
                 fprintf(stderr, "Syntax error near -m\n");
-                exit(EINVAL);
+                return ExitCode::ERROR_INVALID_ARGS;
             }
         }
         if (argc >= 2 && strncmp(argv[i], "-i", 2) == 0) {
@@ -894,7 +1007,7 @@ int main(int argc, char **argv) {
                 device_id = strtol(argv[i], NULL, 0);
             } else {
                 fprintf(stderr, "Syntax error near -i\n");
-                exit(EINVAL);
+                return ExitCode::ERROR_INVALID_ARGS;
             }
         }
         if (argc >= 2 && strncmp(argv[i], "-c", 2) == 0) {
@@ -905,7 +1018,7 @@ int main(int argc, char **argv) {
                 thisParam++;
             }
         }
-        if (argc >= 2 && strncmp(argv[i], "-stts", 2) == 0) {
+        if (argc >= 2 && strncmp(argv[i], "-stts", 5) == 0) {
             thisParam++;
 
             if (argv[i + 1]) {
@@ -913,21 +1026,49 @@ int main(int argc, char **argv) {
                 thisParam++;
             }
         }
+        if (argc >= 2 && strncmp(argv[i], "-o", 2) == 0) {
+            thisParam++;
+
+            if (i + 1 < args.size()) {
+                outputFile = argv[i + 1];
+                thisParam++;
+                i++;
+            } else {
+                fprintf(stderr, "Syntax error: -o requires output filename\n");
+                return ExitCode::ERROR_INVALID_ARGS;
+            }
+        }
+        if (argc >= 2 && strncmp(argv[i], "-cfg", 4) == 0) {
+            thisParam += 2; // Config file already processed above
+            i++;
+        }
     }
 
     if (argc - thisParam < 2)
         printf("Run length not specified in the command line. ");
     else
         runLength = atoi(argv[1 + thisParam]);
+
+    // Initialize structured logger
+    g_logger.init(outputFile);
+    if (g_logger.isEnabled()) {
+        printf("Structured output enabled: %s\n", outputFile.c_str());
+    }
+
+#ifdef EMBED_PTX
+    printf("Using embedded compare kernel\n");
+#else
     printf("Using compare file: %s\n", kernelFile);
+#endif
     printf("Burning for %d seconds.\n", runLength);
 
+    int exitCode;
     if (useDoubles)
-        launch<double>(runLength, useDoubles, useTensorCores, useBytes,
+        exitCode = launch<double>(runLength, useDoubles, useTensorCores, useBytes,
                        device_id, kernelFile, sigterm_timeout_threshold_secs);
     else
-        launch<float>(runLength, useDoubles, useTensorCores, useBytes,
+        exitCode = launch<float>(runLength, useDoubles, useTensorCores, useBytes,
                       device_id, kernelFile, sigterm_timeout_threshold_secs);
 
-    return 0;
+    return exitCode;
 }

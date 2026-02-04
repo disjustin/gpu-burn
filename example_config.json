@@ -1,0 +1,8 @@
+{
+  "duration": 3600,
+  "use_doubles": false,
+  "use_tensor_cores": true,
+  "device_id": -1,
+  "memory_percent": 90,
+  "output_file": "gpu_burn_results.json"
+}

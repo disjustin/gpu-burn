@@ -33,22 +33,23 @@ IMAGE_DISTRO ?= ubi8
 override NVCCFLAGS ?=
 override NVCCFLAGS += -I${CUDAPATH}/include
 override NVCCFLAGS += -arch=compute_$(subst .,,${COMPUTE})
+override NVCCFLAGS += -Wno-deprecated-gpu-targets
 
 IMAGE_NAME ?= gpu-burn
 
 .PHONY: clean
 
 gpu_burn: gpu_burn-drv.o compare.ptx
-	g++ -o $@ $< -O3 ${LDFLAGS}
+	@g++ -o $@ $< -O3 ${LDFLAGS}
 
 %.o: %.cpp
-	g++ ${CFLAGS} -c $<
+	@g++ ${CFLAGS} -c $<
 
 %.ptx: %.cu
-	PATH="${PATH}:${CCPATH}:." ${NVCC} ${NVCCFLAGS} -ptx $< -o $@
+	@PATH="${PATH}:${CCPATH}:." ${NVCC} ${NVCCFLAGS} -ptx $< -o $@
 
 clean:
-	$(RM) *.ptx *.o gpu_burn
+	@$(RM) *.ptx *.o gpu_burn
 
 image:
-	docker build --build-arg CUDA_VERSION=${CUDA_VERSION} --build-arg IMAGE_DISTRO=${IMAGE_DISTRO} -t ${IMAGE_NAME} .
+	@docker build --build-arg CUDA_VERSION=${CUDA_VERSION} --build-arg IMAGE_DISTRO=${IMAGE_DISTRO} -t ${IMAGE_NAME} .
